@@ -1,0 +1,291 @@
+#1.
+#View that contains all entries for each record in AccountRecords for each account in Accounts
+
+DROP VIEW IF EXISTS AllAccountRecords;
+
+create view AllAccountRecords(PID, AID, aBalance, aOver, RID, rDate, rType, rAmount, rBalance) 
+as
+select A.PID, A.AID,  A.aBalance, A.aOver, R.RID, R.rdate, R.rType, R.rAmount, R.rBalance
+from Accounts A left join AccountRecords R
+ON R.AID = A.AID;
+
+
+#2.
+#View that contains all persons who are in debt on at least one of their account. It shows their total 
+#amount of all their accounts.
+
+DROP VIEW IF EXISTS DebtorStatus;
+
+create view DebtorStatus(PID, pName, TotalAmount)
+as
+select P.PID, P.pName, sum(A.aBalance)
+from People P, Accounts A
+where P.PID = A.PID
+group by P.PID, P.pName
+having min(A.aBalance) < 0;
+
+#3.
+
+#This view contains sum of people’s accounts minus their bills that are due and unpaid
+
+DROP VIEW IF EXISTS AccountsWithBills;
+
+CREATE VIEW AccountsWithBills(PID, aBalance)
+AS
+SELECT P.PID, SUM(A.aBalance) -  Sum(B.bAmount)
+FROM Bills B, Accounts A, People P
+WHERE B.PID = A.PID
+AND P.PID = A.PID
+AND B.bIsPaid = 0
+AND B.bDueDate < CURDATE()
+GROUP BY P.PID, P.pName;
+
+#This view contains the sum of people’s account that have no bills due and unpaid.
+
+DROP VIEW IF EXISTS AccountsWithoutBills;
+
+CREATE VIEW AccountsWithoutBills(PID, aBalance)
+AS
+Select A.PID, SUM(A.aBalance)
+FROM Accounts A
+WHERE A.PID Not in (SELECT A.PID
+		    FROM AccountsWithBills A)
+GROUP BY A.PID;
+
+#This view shows all PID and sums of accounts for the 2 views above.
+
+DROP VIEW IF EXISTS FinancialStatus;
+
+CREATE VIEW FinancialStatus(PID, pName, financialBalance)
+AS
+SELECT P.PID, P.pName, IF(P.PID = A1.PID, A1.aBalance, A2.aBalance)
+FROM People P, AccountsWithBills A1, AccountsWithoutBills A2
+WHERE P.PID = A1.PID
+OR P.PID = A2.PID
+GROUP BY P.PID;
+
+#4.
+#This trigger checks if the account exists and if there are sufficient funds for the transaction.
+
+DROP TRIGGER if exists CheckAmount;
+
+DELIMITER $$	
+CREATE	TRIGGER	CheckAmount	BEFORE	INSERT	ON AccountRecords
+FOR	EACH ROW	
+BEGIN	
+	IF(NOT EXISTS(SELECT *
+				  FROM Accounts A
+				  WHERE A.AID = NEW.AID)) THEN
+	SIGNAL SQLSTATE '45000'
+	SET MESSAGE_TEXT = "This account does not exist";
+	END IF;
+	
+	IF(EXISTS( SELECT *	
+			FROM Accounts A
+			WHERE NEW.AID = A.AID
+			AND (NEW.rAmount + A.aBalance + aOver) < 0)) THEN	
+	SIGNAL	SQLSTATE '45000'	
+	SET	MESSAGE_TEXT = "Balance is to low for this transaction";	
+	END	IF;	
+
+	#If there are sufficient funds and the account exists, then insert the record and update the
+	#total amount of the account and last date of a transaction.
+	UPDATE Accounts A
+	SET A.adate = NEW.rdate, A.aBalance = A.aBalance + NEW.rAmount
+	WHERE A.AID = NEW.AID;
+	
+	SET NEW.rBalance = (SELECT A.aBalance
+						FROM Accounts A
+						WHERE A.AID = NEW.AID);
+	
+END$$	
+
+DELIMITER ;
+
+#5.
+#This trigger checks if the bill amount is negative and if the bill date is not in the future.
+
+drop trigger if exists CheckBills;
+delimiter $$
+Create trigger CheckBills Before insert on Bills
+	for each row
+	begin
+	IF (NEW.bAmount < 0) THEN
+	SIGNAL SQLSTATE '45000'
+	SET MESSAGE_TEXT = 'Bill amount cannot not negative';
+end if;
+
+	IF (NEW.bDueDate <= curdate()) THEN
+	SIGNAL SQLSTATE '45000'
+	SET MESSAGE_TEXT = 'Bill date must be in the future';
+end if;
+end$$
+DELIMITER ;
+
+
+#6.
+#This trigger checks whether the gender value is correct and that height is not negative.
+
+drop trigger if exists CheckPeople;
+delimiter $$
+Create trigger CheckPeople Before insert on People
+	for each row
+	begin
+	IF (NEW.pGender != 'M' AND
+		NEW.pGender != 'F') THEN
+		SIGNAL SQLSTATE '45000'
+		SET MESSAGE_TEXT = "Incorrect gender value";
+end if;
+
+	IF (NEW.pHeight < 0) then
+	SIGNAL SQLSTATE '45000'
+	SET MESSAGE_TEXT = "Height is negative";
+end if;
+end$$
+DELIMITER ;
+
+#7.
+
+#This view contains the sum of aBalance and aOver for all accounts. 
+
+DROP VIEW IF EXISTS SumAccountsAndOver;
+
+CREATE VIEW SumAccountsAndOver(PID, AID, Sum)
+AS
+SELECT A.PID, A.AID, A.aBalance + A.aOver
+FROM Accounts A;
+
+#This procedure pays all unpaid and due bills for a perticular person.
+
+drop procedure if exists PayAllBills;
+delimiter $$
+Create procedure PayAllBills(IN pPID int)
+begin
+	DECLARE pabAID int;
+	DECLARE pabAmount int;
+	#Check if there are any bills to be paid.
+	if(NOT EXISTS(SELECT *
+			FROM Bills B
+			WHERE pPID = B.PID
+			AND B.bIsPaid = 0
+			AND B.bDueDate < curdate())) then 
+			SIGNAL SQLSTATE '45000'
+			SET MESSAGE_TEXT = 'There are no bills to be paid';
+	end if;
+	#Check if the person has an account.
+	if(NOT EXISTS( SELECT *
+		FROM Accounts A
+		WHERE A.PID = pPID)) then
+		SIGNAL SQLSTATE '45000'
+		SET MESSAGE_TEXT = "This person does not have an account.";
+				
+	end if;
+		#Get the AID for the persons account that has the highest aBalance and aOver.
+		SET pabAID = (Select AID FROM SumAccountsAndOver A
+						WHERE pPID = A.PID
+						AND A.Sum = (SELECT MAX(A1.Sum) 
+							     FROM SumAccountsAndOver A1
+							     WHERE A1.PID = pPID));
+		
+		#Get the total amount for the bills to be paid.
+		SET pabAmount = (SELECT SUM(bAmount) FROM Bills B
+							WHERE pPID = B.PID
+							AND B.bIsPaid = 0
+							AND B.bDueDate < curdate());
+		
+		INSERT INTO AccountRecords(AID, rDate, rType, rAmount) VALUES(pabAID, curdate(), 'B', -pabAmount);
+		#Update the bill to paid.
+		UPDATE Bills B
+		SET B.bIsPaid = 1
+		WHERE B.PID = pPID
+		AND B.bDueDate < curdate();
+
+end$$
+DELIMITER ; 
+
+
+#8.
+#This procedure refunds a particular bill to the persons account with the lowest balance.
+
+drop procedure if exists RefundBill;
+delimiter $$
+Create procedure RefundBill(IN rBID int)
+begin
+	DECLARE rbAID int;
+	DECLARE rbAmount int;
+	#Check if the bill has been paid.
+	if(NOT EXISTS(SELECT * FROM Bills B
+				WHERE B.BID = rBID
+				AND B.bIsPaid = 1)) then
+				SIGNAL SQLSTATE '45000'
+				SET MESSAGE_TEXT = 'Bills is not paid';
+end if;
+	#Get the AID for the persons account with the lowest balance. We decided not to check aOver.
+	SET rbAID = (SELECT AID FROM Accounts A, Bills B 
+				 WHERE B.BID = rBID
+				 AND B.PID = A.PID
+				 AND A.aBalance = (SELECT MIN(A2.aBalance) FROM Accounts A2
+									WHERE A.PID = A2.PID));
+	#Get the amount of the bill.
+	SET rbAmount = (SELECT B.bAmount from Bills B
+					WHERE B.BID = rBid);
+	INSERT INTO AccountRecords(AID, rDate, rType, rAmount) VALUES(rbAID, curdate(), 'O', rbAmount);
+	#Set the bill to unpaid again.
+	UPDATE Bills B
+	SET B.bISPaid = 0
+	WHERE B.BID = rBID;
+end $$
+DELIMITER ;
+
+#9.
+#This procedure transfers money between accounts.
+ 
+drop procedure if exists Transfer;
+delimiter $$
+Create procedure Transfer(IN toAID int, IN fromAID int, IN transfers INT)
+begin
+	#Check if amount is negative.
+	IF(transfers < 0) then
+	SIGNAL SQLSTATE '45000'
+	SET MESSAGE_TEXT = "Transfer Amount cannot be negative";
+end if;
+	#Check if withdrawal account exists.
+	IF(NOT EXISTS(SELECT *
+				FROM Accounts A
+				WHERE A.AID = fromAID)) then
+				SIGNAL SQLSTATE '45000'
+				SET MESSAGE_TEXT = 'Withdrawal account does not exist'; 
+end if;
+	#Check if deposit account exists.
+	IF(NOT EXISTS(SELECT *
+				FROM Accounts A
+				WHERE A.AID = toAID)) then
+				SIGNAL SQLSTATE '45000'
+				SET MESSAGE_TEXT = 'Deposit account does not exist'; 
+end if;
+	INSERT INTO AccountRecords(AID, rDate, rType, rAmount) VALUES(fromAID, curdate(), 'T', -transfers);
+	INSERT INTO AccountRecords(AID, rDate, rType, rAmount) VALUES(toAID, curdate(), 'T', transfers);
+end $$
+DELIMITER ;
+
+#10.
+#This procedure loans money to an account and creates a bill for the person that owns that account.
+
+drop procedure if exists LoanMoney;
+delimiter $$
+Create procedure LoanMoney(IN AID int, IN IAmount int, IN IDueDate date)
+begin
+	
+	DECLARE bPID int;
+	#Check if the loan amount is negative.
+	IF(IAmount < 0) THEN
+	SIGNAL SQLSTATE '45000'
+	SET MESSAGE_TEXT = "Loan amount cannot be negative";
+	END IF;
+	#Get the PID that owns the account being loaned to.
+	SET bPID = (SELECT A.PID FROM Accounts A 
+				WHERE A.AID = AID);
+	INSERT INTO Bills(PID, bDueDate, bAmount, bIsPaid) VALUES(bPID, IDueDate, IAmount, 0);
+	INSERT INTO AccountRecords(AID, rDate, rType, rAmount) VALUES(AID, curdate(), 'L', IAmount);
+end $$
+DELIMITER ;
